@@ -1,0 +1,46 @@
+[build-system]
+requires = ["flit_core==3.12.0"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "langchain-oddsrelay"
+version = "0.1.0"
+description = "LangChain tools for OddsRelay: bookmaker and exchange odds for the UK & Ireland, with a token cap on every call that spends tokens."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "OddsRelay", email = "hello@oddsrelay.io" }]
+keywords = ["langchain", "langchain-tools", "agents", "odds", "odds api", "bookmakers", "betting exchange", "sports data"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = ["langchain-core>=1.0.0,<2.0.0", "oddsrelay>=0.1.0,<1.0.0"]
+
+[project.urls]
+Homepage = "https://oddsrelay.io"
+Documentation = "https://oddsrelay.io/docs"
+Source = "https://github.com/oddsrelay/langchain-oddsrelay"
+Changelog = "https://github.com/oddsrelay/langchain-oddsrelay/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+test = ["langchain-tests==1.1.9"]
+
+[tool.flit.sdist]
+include = ["CHANGELOG.md", "tests/"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "--disable-socket --allow-unix-socket"
