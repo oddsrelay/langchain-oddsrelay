@@ -8,12 +8,13 @@ max_tokens: a cap the developer sets where the tool is made, which the model can
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Annotated, Any, ClassVar, Literal
 
 from langchain_core.tools import BaseTool, BaseToolkit, ToolException
 from langchain_core.utils import secret_from_env
 from oddsrelay import APIError, OddsRelay, OddsRelayError, QuoteTooHigh, Result
-from pydantic import AfterValidator, BaseModel, Field, SecretStr, StringConstraints
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 
 __version__ = "0.1.0"
 __all__ = [
@@ -26,7 +27,7 @@ __all__ = [
     "__version__",
 ]
 
-DEFAULT_MAX_TOKENS = 500  # the most one spending call may cost when the developer sets no max_tokens
+DEFAULT_MAX_TOKENS = 500  # the cap when the developer sets no max_tokens: a call quoted above it is not made
 REPLY_BUDGET = 30_000  # characters of rows per reply, so one reply fits in an agent's context
 NO_KEY = "Set ODDSRELAY_KEY to your OddsRelay API key, or pass api_key."
 
@@ -64,22 +65,27 @@ _TO = "Latest start time, ISO 8601"
 class _OddsRelayTool(BaseTool):
     """What every tool shares: the key, errors handed back to the model, and the reply text."""
 
+    model_config = ConfigDict(validate_assignment=True)  # a key or cap changed after the tool is made is checked too
+
     api_key: ApiKey = _key_field()
     """Your OddsRelay API key. Left out, it is read from ODDSRELAY_KEY."""
-    handle_tool_error: bool = True
-    """A refused call (over the cap, a bad filter, a network failure) goes back to the model as a tool error."""
+    handle_tool_error: bool | str | Callable[[ToolException], str] | None = True
+    """A refused call (over the cap, a bad filter, a network failure) goes back to the model as a tool error.
+    LangChain's other forms work too: False raises the ToolException, and a string or a function words it your way."""
     narrow: ClassVar[str] = ""  # what to change when a call is priced above the cap
 
-    def _run(self, **kwargs: Any) -> str:
-        # Validated again here: older langchain-core versions pass only the arguments given, not the defaults.
-        args = self.get_input_schema().model_validate(kwargs)
+    def _run(self, *args: Any, **kwargs: Any) -> str:
+        schema = self.get_input_schema()
+        if args:  # tool.invoke("tennis"): LangChain passes a plain string alone, meant for the first argument
+            kwargs[next(iter(schema.model_fields))] = args[0]
+        a = schema.model_validate(kwargs)  # the arguments as attributes, defaults included
         key = self.api_key.get_secret_value()
         try:
             # A fresh client per call: nothing is shared between threads, and no ETag is sent.
             # ponytail: a repeated call is charged again; keep one client per tool if repeats turn out to matter.
-            body = self._read(OddsRelay(key), args)
-        except (OddsRelayError, OSError) as err:
-            raise ToolException(_text(_explain(err, self.narrow), key)) from None
+            body = self._read(OddsRelay(key), a)
+        except Exception as err:  # every failure goes back to the model as a tool error, so the agent's run goes on
+            raise ToolException(_text(_explain(err, self), key)) from None
         return _text(body, key)
 
     def _read(self, client: OddsRelay, args: Any) -> dict:
@@ -88,7 +94,7 @@ class _OddsRelayTool(BaseTool):
 
 class _SpendingTool(_OddsRelayTool):
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=0)
-    """The most one call may cost, in tokens. A call priced above it is not made. Set by you, never by the model."""
+    """The cap, in tokens: a call quoted above it is not made. Set by you, never by the model."""
 
 
 class _SportsInput(BaseModel):
@@ -158,18 +164,15 @@ class OddsRelayBookmakers(_OddsRelayTool):
 
 class _OddsInput(BaseModel):
     type: Literal["standard", "2up", "dutching", "each-way", "extra-place", "bog"] = Field(
-        description="Which matched board"
+        description="Which matched board: standard, unless the user asks for another"
     )
     sport: Key = Field(description="Which sport: soccer, or a competition key from oddsrelay_sports such as soccer_epl")
     bookmakers: list[Key] = Field(min_length=1, max_length=40, description="Bookmaker keys from oddsrelay_bookmakers")
     exchanges: list[Key] | None = Field(
-        default=None, min_length=1, max_length=4, description="Exchange keys; left out, every exchange on the board"
+        default=None, max_length=4, description="Exchange keys; left out, every exchange on the board"
     )
     markets: list[Key] | None = Field(
-        default=None,
-        min_length=1,
-        max_length=20,
-        description="Market keys such as h2h; left out, every market on the board",
+        default=None, max_length=20, description="Market keys such as h2h; left out, every market on the board"
     )
     commence_from: str | None = Field(default=None, description=_FROM)
     commence_to: str | None = Field(default=None, description=_TO)
@@ -182,11 +185,15 @@ class OddsRelayOdds(_SpendingTool):
 
     name: str = "oddsrelay_odds"
     description: str = (
-        "Reads a matched board (bookmaker back prices with exchange lay prices) for one sport at the bookmakers "
-        "you name. Spends tokens: priced first, and refused when the price is above this tool's cap."
+        "Reads a matched board for one sport at the bookmakers you name: bookmaker back prices beside exchange lay "
+        "prices, or on dutching, sets of back prices covering every outcome of an event. Spends tokens: priced "
+        "first, and refused when the price is above this tool's cap."
     )
     args_schema: type[BaseModel] = _OddsInput
-    narrow: ClassVar[str] = "Narrow the filters: fewer bookmakers or markets, or a shorter time window."
+    narrow: ClassVar[str] = (
+        "On a standard or dutching board, naming fewer bookmakers, exchanges or markets can lower the price. The "
+        "other boards cost the same whatever the filters, and the kick-off window and limit never change a price."
+    )
 
     def _read(self, client: OddsRelay, a: _OddsInput) -> dict:
         res = client.odds(
@@ -195,8 +202,8 @@ class OddsRelayOdds(_SpendingTool):
             region=a.region,
             sports=a.sport,
             bookmakers=a.bookmakers,
-            exchanges=a.exchanges,
-            markets=a.markets,
+            exchanges=a.exchanges or None,  # an empty list means no filter, as left out does
+            markets=a.markets or None,
             commence_time_from=a.commence_from,
             commence_time_to=a.commence_to,
         )
@@ -206,11 +213,9 @@ class OddsRelayOdds(_SpendingTool):
 class _EventOddsInput(BaseModel):
     id: Key = Field(description="An event id from oddsrelay_events or oddsrelay_odds, such as or_evt_da71d5873e85")
     bookmakers: list[Key] | None = Field(
-        default=None, min_length=1, max_length=40, description="Only these bookmaker or exchange keys"
+        default=None, max_length=40, description="Only these bookmaker or exchange keys"
     )
-    markets: list[Key] | None = Field(
-        default=None, min_length=1, max_length=20, description="Only these market keys, such as h2h"
-    )
+    markets: list[Key] | None = Field(default=None, max_length=20, description="Only these market keys, such as h2h")
     region: Key | None = Field(default=None, description=_REGION)
     limit: int = _limit("bookmakers", 10)
 
@@ -235,6 +240,8 @@ class OddsRelayEventOdds(_SpendingTool):
             for b in res.data["bookmakers"]
             if not a.bookmakers or b["key"] in a.bookmakers
         ]
+        if a.markets:  # a venue with none of the named markets is left out, so it takes no place under limit
+            books = [b for b in books if b["markets"]]
         return {**res.data, **_trim(books, a.limit, "bookmakers"), "tokens": _spent(res)}
 
 
@@ -244,7 +251,7 @@ class OddsRelayToolkit(BaseToolkit):
     api_key: ApiKey = _key_field()
     """Your OddsRelay API key. Left out, it is read from ODDSRELAY_KEY."""
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=0)
-    """The cap handed to both tools that spend tokens: the most one call may cost."""
+    """The cap handed to both tools that spend tokens: a call quoted above it is not made."""
 
     def get_tools(self) -> list[BaseTool]:
         key, cap = self.api_key, self.max_tokens
@@ -285,7 +292,7 @@ def _fit(rows: list, limit: int) -> int:
 
 
 def _trim(rows: list, limit: int, noun: str) -> dict:
-    """The rows that fit, and a note counting the rest."""
+    """The rows that fit, and a note counting the rest. Only the tools that spend tokens trim this way."""
     n = _fit(rows, limit)
     if n == len(rows):
         return {noun: rows}
@@ -293,7 +300,7 @@ def _trim(rows: list, limit: int, noun: str) -> dict:
         why = ", to keep the reply short: narrow the filters"
     else:
         why = ": raise limit (up to 100) or narrow the filters"
-    return {noun: rows[:n], "more": f"{len(rows) - n} more {noun} not shown{why}"}
+    return {noun: rows[:n], "more": f"{len(rows) - n} more {noun} not shown{why} (a new call, charged again)"}
 
 
 def _unpack(cursor: str | None) -> tuple[int, str | None]:
@@ -313,14 +320,14 @@ def _page(body: dict, skip: int, api: str | None, limit: int, noun: str) -> dict
     return {noun: rows[:n], "more": more, "next_cursor": f"{skip + n}:{api or ''}"}
 
 
-def _explain(err: Exception, narrow: str) -> dict:
+def _explain(err: Exception, tool: _OddsRelayTool) -> dict:
     """The error the model reads: what went wrong and what the API sent with it, never a stack trace."""
     if isinstance(err, QuoteTooHigh):
         out = {
             "error": "over_max_tokens",
             "message": f"This call is priced at {err.cost} tokens, above this tool's max_tokens of {err.max_tokens}, "
-            f"so it was not made and nothing was spent. {narrow} The cap is set where the tool is created, not in "
-            "this call.",
+            f"so it was not made and nothing was spent. {tool.narrow} Only the developer can raise the cap, where "
+            "the tool is created: it is not an argument of this call.",
             "cost": err.cost,
             "max_tokens": err.max_tokens,
             "remaining": err.quote.data.get("remaining"),
@@ -339,6 +346,9 @@ def _explain(err: Exception, narrow: str) -> dict:
         }
     elif isinstance(err, OddsRelayError):
         out = {"error": "client_error", "message": str(err)}
-    else:
-        out = {"error": "network_error", "message": f"The OddsRelay API could not be reached: {err}"}
+    else:  # the network, a reply cut off or garbled on the way, or one this package could not read
+        message = f"The call failed before a usable reply came back ({type(err).__name__}: {err})."
+        if isinstance(tool, _SpendingTool):  # the paid request may have reached the API before its reply was lost
+            message += " If it reached the API it may have been charged, so calling again may be charged again."
+        out = {"error": "request_failed", "message": message}
     return {k: v for k, v in out.items() if v is not None}

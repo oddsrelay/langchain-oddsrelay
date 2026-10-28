@@ -26,7 +26,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
-dependencies = ["langchain-core>=1.0.0,<2.0.0", "oddsrelay>=0.1.0,<1.0.0"]
+# langchain-core 1.4.0 is the oldest LangChain's standard tests (langchain-tests) run on.
+dependencies = ["langchain-core>=1.4.0,<2.0.0", "oddsrelay>=0.1.0,<1.0.0"]
 
 [project.urls]
 Homepage = "https://oddsrelay.io"

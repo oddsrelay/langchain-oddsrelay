@@ -98,10 +98,12 @@ print(event_odds.invoke({"id": page["events"][0]["id"], "markets": ["h2h"]}))
 
 `oddsrelay_odds` and `oddsrelay_event_odds` spend tokens. Before each call the tool asks the API what the call would
 cost (a quote, which spends nothing). If the price is above the tool's `max_tokens`, it makes no call, spends nothing
-and tells the agent the price in a tool error. A price equal to the cap goes ahead.
+and tells the agent the price in a tool error. A price equal to the cap goes ahead. The price is quoted a moment before
+the call, and an event's price moves with the board, so an `oddsrelay_event_odds` call can cost a little more or less
+than its quote.
 
-`max_tokens` has a small default. Set your own where you make the tool or the toolkit, where `my_cap` is the most one
-call may spend, in tokens:
+`max_tokens` has a small default. Set your own where you make the tool or the toolkit, where `my_cap` is the highest
+price, in tokens, at which a call still goes ahead:
 
 ```python
 from langchain_oddsrelay import OddsRelayOdds, OddsRelayToolkit
@@ -115,15 +117,17 @@ sends is ignored. It caps each call, not the whole run, so an agent that makes m
 each. To bound a run, also limit how many calls the agent makes, for example with LangChain's
 `ToolCallLimitMiddleware`.
 
-Every reply from these two tools carries `tokens`: what the call cost and what is left. `oddsrelay_odds` always takes
-one sport and the bookmakers you name, so each call stays narrow. Its cost is set by the filters it sends, and cutting
-the reply to `limit` rows does not change it. `oddsrelay_event_odds` is priced as the whole event, whichever
-bookmakers and markets you name, and it needs a key that can read raw odds.
+Every reply from these two tools carries `tokens`: what the call cost and what is left. The price of an
+`oddsrelay_odds` call is set by its board and, on `standard` and `dutching`, by the sport, bookmakers, exchanges and
+markets it names. The kick-off window never changes it, and nor does cutting the reply to `limit` rows. When a call is
+refused over the cap, the tool error says which of these can bring the price down. `oddsrelay_event_odds` is priced as
+the whole event, whichever bookmakers and markets you name, and it needs a key that can read raw odds.
 
 ## Replies
 
 Replies are compact JSON. Long lists are cut to `limit` rows (each tool has its own default) and to a size an agent
-can read in one go, with a `more` note saying how many rows were left out and what to change to see them.
+can read in one go, with a `more` note saying how many rows were left out and what to change to see them. On the two
+tools that spend tokens, seeing them is a new call, charged again.
 `oddsrelay_sports` and `oddsrelay_events` return `next_cursor`, which the agent passes back as `cursor`. A page cut
 short goes on from the first row not shown.
 
@@ -131,11 +135,16 @@ Each call makes a fresh client, so a repeated call is priced and charged again.
 
 ## Errors
 
-A refused call reaches the agent as a tool error, a `ToolMessage` with `status="error"`, and the run goes on. It
-carries the API's error `code`, its message, `request_id` and, where the API sends them, the accepted keys: ask for an
-unknown bookmaker and the error lists the keys it accepts. A 402 (not enough tokens left) keeps `cost`, `remaining`
-and `resets_at`. A network failure is a tool error too. In an agent made with `create_agent`, arguments that do not
-fit a tool's schema also come back to the model as an error.
+A refused call reaches the agent as a tool error, a `ToolMessage` with `status="error"`, and the run goes on. Its JSON
+carries `error` (the API's error code), `message`, `request_id` and, where the API sends them, `valid`, the keys it
+accepts: ask for an unknown bookmaker and `valid` lists the bookmaker keys. A 402 (not enough tokens left) keeps
+`cost`, `remaining` and `resets_at`. A call that fails on the way, from the network or a reply cut off, is a tool
+error too, `request_failed`. On the two tools that spend tokens it says the call may have been charged, since a
+request can reach the API before its reply is lost. In an agent made with `create_agent`, arguments that do not fit a
+tool's schema also come back to the model as an error.
+
+To handle errors yourself, pass `handle_tool_error` as with any LangChain tool: `False` raises the `ToolException`,
+and a string or a function words the error your way.
 
 A missing key fails when the tool is made, not at its first call: a `ValueError` naming `ODDSRELAY_KEY`.
 

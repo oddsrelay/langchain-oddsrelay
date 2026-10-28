@@ -6,6 +6,8 @@ and pytest needs --force-enable-socket for it. The two spending tools quote firs
 
 from __future__ import annotations
 
+import functools
+import json
 import os
 
 import pytest
@@ -27,12 +29,20 @@ LIVE = os.environ.get("ODDSRELAY_LIVE") == "1"
 class _Replies:
     @property
     def tool_constructor_params(self) -> dict:
-        return {} if LIVE else {"api_key": KEY}  # live: the key comes from ODDSRELAY_KEY
+        # A refused call raises instead of coming back as a tool error, so the test fails on it.
+        return {"handle_tool_error": False, **({} if LIVE else {"api_key": KEY})}  # live: the key is ODDSRELAY_KEY
 
     @pytest.fixture(autouse=True)
     def _replies(self, request):
         if not LIVE:
             request.getfixturevalue("opener")
+
+
+@functools.cache
+def _event_on_the_board() -> str:
+    """Live: an event on the board now, from oddsrelay_events, which costs no tokens."""
+    page = OddsRelayEvents(handle_tool_error=False).invoke({"sport": "tennis", "limit": 1})
+    return json.loads(page)["events"][0]["id"]
 
 
 class TestSports(_Replies, ToolsIntegrationTests):
@@ -56,4 +66,8 @@ class TestOdds(_Replies, ToolsIntegrationTests):
 
 class TestEventOdds(_Replies, ToolsIntegrationTests):
     tool_constructor = OddsRelayEventOdds
-    tool_invoke_params_example = {"id": "or_evt_da71d5873e85", "markets": ["h2h"], "limit": 3}
+
+    @property
+    def tool_invoke_params_example(self) -> dict:
+        event = _event_on_the_board() if LIVE else "or_evt_da71d5873e85"  # stubbed: the contract's example event
+        return {"id": event, "markets": ["h2h"], "limit": 3}

@@ -58,7 +58,7 @@ class Opener:
         headers["Content-Encoding"] = "gzip"
         for name, value in extra.items():
             headers[name] = value
-        raw = gzip.compress(json.dumps(body).encode())
+        raw = gzip.compress(body if isinstance(body, bytes) else json.dumps(body).encode())  # bytes: sent as they are
         if status >= 300:  # urllib raises for these, as the real opener does
             raise urllib.error.HTTPError(req.full_url, status, "", headers, io.BytesIO(raw))
         return FakeResponse(status, headers, raw)

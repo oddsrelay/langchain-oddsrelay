@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.parse
@@ -77,6 +78,14 @@ def test_the_model_cannot_raise_the_cap(opener):
     assert status == "error" and body["max_tokens"] == 500 and len(opener.requests) == 1
 
 
+def test_the_cap_cannot_be_switched_off_once_the_tool_is_made():
+    tool = OddsRelayOdds(api_key=KEY)
+    for off in (None, -1):
+        with pytest.raises(ValueError, match="max_tokens"):
+            tool.max_tokens = off
+    assert tool.max_tokens == 500
+
+
 def test_the_toolkit_hands_one_key_and_one_cap_to_every_tool():
     tools = OddsRelayToolkit(api_key=KEY, max_tokens=50).get_tools()
     assert [t.name for t in tools] == [
@@ -140,6 +149,43 @@ def test_event_odds_narrows_the_reply_to_the_named_bookmakers_and_markets(opener
     assert all({"bookmakers", "markets"}.isdisjoint(q(r)) for r in opener.requests)  # the route takes neither
     body, _ = call(OddsRelayEventOdds(api_key=KEY), {**EVENT, "limit": 1})
     assert len(body["bookmakers"]) == 1 and body["more"].startswith("1 more bookmakers not shown")
+    assert body["more"].endswith("(a new call, charged again)")
+
+
+def test_event_odds_leaves_out_venues_with_none_of_the_named_markets(opener):
+    event = fixture("v2-odds-event.json")
+    bet600, betgoodwin = event["bookmakers"]
+    event["bookmakers"] = [{**bet600, "markets": bet600["markets"][:1]}] * 12 + [betgoodwin]  # 12 with h2h only
+    opener.route = lambda u: by_path(u) if "quote=true" in u.query else (200, event, {})
+    body, status = call(OddsRelayEventOdds(api_key=KEY), {**EVENT, "markets": ["correct_score"]})
+    assert status == "success" and "more" not in body
+    assert [(b["key"], [m["key"] for m in b["markets"]]) for b in body["bookmakers"]] == [
+        ("betgoodwin", ["correct_score"])
+    ]
+
+
+def test_empty_filter_lists_mean_no_filter(opener):
+    body, status = call(OddsRelayOdds(api_key=KEY), {**ODDS, "exchanges": [], "markets": []})
+    assert status == "success"
+    assert all({"exchanges", "markets"}.isdisjoint(q(r)) for r in opener.requests)
+    body, status = call(OddsRelayEventOdds(api_key=KEY), {**EVENT, "bookmakers": [], "markets": []})
+    assert status == "success" and len(body["bookmakers"]) == 2
+
+
+def test_a_plain_string_goes_to_the_first_argument(opener):
+    assert json.loads(OddsRelayEvents(api_key=KEY).invoke("tennis"))["events"]
+    assert q(opener.requests[-1])["sport"] == "tennis"
+    assert json.loads(OddsRelaySports(api_key=KEY).invoke("uk"))["sports"]
+    assert q(opener.requests[-1])["region"] == "uk"
+
+
+def test_handle_tool_error_takes_langchains_other_forms(opener):
+    opener.route = quoted(900)
+    for handler, content in [(lambda e: "refused", "refused"), ("Sorry, the odds tool failed.", None)]:
+        msg = OddsRelayOdds(api_key=KEY, handle_tool_error=handler).invoke(
+            ToolCall(name="oddsrelay_odds", args=ODDS, id="1", type="tool_call")
+        )
+        assert msg.status == "error" and msg.content == (content or handler)
 
 
 def test_paged_tools_reach_every_row_when_limit_cuts_a_page_short(opener):
@@ -161,13 +207,34 @@ def test_paged_tools_reach_every_row_when_limit_cuts_a_page_short(opener):
     assert seen == ["a0", "a1", "a2", "b0"]
 
 
-def test_a_network_failure_is_a_tool_error(opener):
-    def down(u):
-        raise OSError("connection refused")
+def fails(err: Exception):
+    """A route that fails on the way, as the network or a cut-off reply does."""
 
-    opener.route = down
+    def route(u):
+        raise err
+
+    return route
+
+
+@pytest.mark.parametrize(
+    "route",
+    [fails(OSError("connection refused")), fails(http.client.IncompleteRead(b"")), lambda u: (200, b"<html>", {})],
+    ids=["no-connection", "cut-off", "not-json"],
+)
+def test_a_failure_on_the_way_is_a_tool_error_and_the_run_goes_on(opener, route):
+    opener.route = route
     body, status = call(OddsRelaySports(api_key=KEY), {})
-    assert status == "error" and body["error"] == "network_error"
+    assert status == "error" and body["error"] == "request_failed"
+    assert "charged" not in body["message"]  # a free tool spends nothing
+
+
+def test_a_spending_call_lost_after_its_quote_says_it_may_have_been_charged(opener):
+    lost = fails(TimeoutError("timed out"))
+    opener.route = lambda u: by_path(u) if "quote=true" in u.query else lost(u)
+    body, status = call(OddsRelayOdds(api_key=KEY), ODDS)
+    assert status == "error" and body["error"] == "request_failed"
+    assert "TimeoutError: timed out" in body["message"] and "may have been charged" in body["message"]
+    assert [q(r).get("quote") for r in opener.requests] == ["true", None]
 
 
 def test_the_version_matches_pyproject():
